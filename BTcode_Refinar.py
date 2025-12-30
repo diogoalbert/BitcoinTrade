@@ -1,105 +1,144 @@
 import pandas as pd
 import re
 
-# 1. Configuração e Limpeza de Dados
 def clean_val(val_str):
     if pd.isna(val_str): return 0.0
-    # Remove siglas de moedas e símbolos, ajusta pontuação brasileira para decimal
-    s = re.sub(r'[A-Z\$]', '', str(val_str)).strip()
-    if not s: return 0.0
-    s = s.replace('.', '').replace(',', '.')
+    # Passo 1: Remover tudo que NÃO for número, vírgula, ponto ou sinal de menos
+    # Isso elimina "R$", "BTC", espaços ocultos, letras, etc.
+    s = re.sub(r'[^\d,\.-]', '', str(val_str))
+    
+    # Passo 2: Ajustar pontuação brasileira (Ex: -1.500,50 vira -1500.50)
+    # Se tiver vírgula e ponto, assumimos que ponto é milhar e removemos
+    if ',' in s and '.' in s:
+        s = s.replace('.', '') # Remove ponto de milhar
+        s = s.replace(',', '.') # Transforma vírgula em ponto decimal
+    elif ',' in s:
+        s = s.replace(',', '.') # Transforma vírgula em ponto decimal
+        
     try:
         return float(s)
     except:
         return 0.0
 
-def processar_fifo(file_path):
-    # Carregar o CSV original
+def processar_relatorio_final(file_path):
+    # Carregar o arquivo
+    print("Lendo arquivo...")
     df = pd.read_csv(file_path, sep=';')
+    
+    # Aplicar a limpeza rigorosa
     df['Val_Numeric'] = df['Quantidade'].apply(clean_val)
+    
+    # Criar Timestamp ordenável
     df['Timestamp'] = pd.to_datetime(df['Data'] + ' ' + df['Hora'], dayfirst=True)
-    df = df.sort_values('Timestamp')
+    df = df.sort_values(['Timestamp', 'Categoria']) # Ordena para processar na sequência certa
 
-    inventory = {} # Dicionário para gerir lotes por moeda
-    results = []
-
-    for _, row in df.iterrows():
-        moeda = row['Moeda']
-        cat = row['Categoria']
-        val = row['Val_Numeric']
+    inventory = {} # Estoque FIFO: { 'BTC': [{'qty': 0.5, 'cost': 1000}, ...], 'ETH': ... }
+    final_output = []
+    
+    # Agrupar por segundo para casar as operações
+    for ts, group in df.groupby('Timestamp'):
+        data_s = ts.strftime('%Y-%m-%d')
+        hora_s = ts.strftime('%H:%M:%S')
         
-        # Ignorar linhas de saldo em Real (apenas rastrear o gasto na Compra)
-        if moeda == 'Real Brasileiro' and cat != 'Venda':
-            continue
+        # 1. ENTRADA DE FIAT (Depósitos)
+        depositos = group[group['Categoria'] == 'Depósito bancário']
+        for _, dep in depositos.iterrows():
+            final_output.append({
+                'operação': 'Entrada', 
+                'Data': data_s, 'hora': hora_s,
+                'Moeda': 'BRL', 'quantidade': '', 
+                'Valor': abs(dep['Val_Numeric']), 
+                'Fees': '', 'Preço unitário': ''
+            })
 
-        evento = {
-            'Data': row['Data'],
-            'Hora': row['Hora'],
-            'Moeda': moeda,
-            'Categoria': cat,
-            'Quantidade': val,
-            'Custo_Base_BRL': 0.0,
-            'Lotes_Origem': ""
-        }
+        # 2. COMPRA (Casar BRL gasto com Cripto recebida)
+        compras_cripto = group[(group['Categoria'] == 'Compra') & (group['Moeda'] != 'Real Brasileiro')]
+        if not compras_cripto.empty:
+            # Captura o valor total em BRL gasto neste timestamp (soma dos valores negativos de BRL)
+            brl_lines = group[(group['Categoria'] == 'Compra') & (group['Moeda'] == 'Real Brasileiro')]
+            valor_brl_total = abs(brl_lines['Val_Numeric'].sum())
+            
+            # Captura taxas (Fees) pagas neste timestamp
+            fee_lines = group[group['Categoria'].str.contains('Taxa sobre compra')]
+            fee_total = abs(fee_lines['Val_Numeric'].sum())
+            
+            total_qtd_cripto = compras_cripto['Val_Numeric'].sum()
+            
+            # Se houver valor BRL detectado, processa
+            if total_qtd_cripto > 0:
+                for _, c in compras_cripto.iterrows():
+                    # Regra de 3 para distribuir o custo se houver múltiplas linhas de cripto
+                    prop = c['Val_Numeric'] / total_qtd_cripto
+                    custo_real = valor_brl_total * prop
+                    fee_real = fee_total * prop
+                    preco_unit = custo_real / c['Val_Numeric'] if c['Val_Numeric'] > 0 else 0
+                    
+                    final_output.append({
+                        'operação': 'Compra',
+                        'Data': data_s, 'hora': hora_s,
+                        'Moeda': c['Moeda'], 
+                        'quantidade': c['Val_Numeric'],
+                        'Valor': round(custo_real, 2), # Aqui está o Custo de Aquisição
+                        'Fees': round(fee_real, 8),
+                        'Preço unitário': round(preco_unit, 2)
+                    })
+                    
+                    # Adiciona ao Estoque FIFO
+                    if c['Moeda'] not in inventory: inventory[c['Moeda']] = []
+                    inventory[c['Moeda']].append({'qty': c['Val_Numeric'], 'cost': custo_real})
 
-        # EVENTO: COMPRA (Geração de Lote)
-        if cat == 'Compra' and moeda != 'Real Brasileiro':
-            # Localizar o gasto em BRL no mesmo timestamp
-            banco_brl = df[(df['Timestamp'] == row['Timestamp']) & 
-                           (df['Moeda'] == 'Real Brasileiro') & 
-                           (df['Categoria'] == 'Compra')]
+        # 3. RETIRADA (Cálculo FIFO de quanto custou esse lote que está saindo)
+        retiradas = group[group['Categoria'] == 'Retirada para carteira externa']
+        if not retiradas.empty:
+            # Soma taxas de mineração deste timestamp
+            miner_fees = abs(group[group['Categoria'].str.contains('Taxa de mineração')]['Val_Numeric'].sum())
             
-            total_cripto_timestamp = df[(df['Timestamp'] == row['Timestamp']) & 
-                                        (df['Moeda'] == moeda) & 
-                                        (df['Categoria'] == 'Compra')]['Val_Numeric'].sum()
-            total_brl_timestamp = abs(banco_brl['Val_Numeric'].sum())
-            
-            # Cálculo do custo proporcional deste lote específico
-            custo_lote = (val / total_cripto_timestamp) * total_brl_timestamp if total_cripto_timestamp > 0 else 0
-            
-            if moeda not in inventory: inventory[moeda] = []
-            inventory[moeda].append({'qty': val, 'cost': custo_lote, 'date': row['Data'], 'hora': row['Hora']})
-            
-            evento['Custo_Base_BRL'] = custo_lote
-            evento['Lotes_Origem'] = "AQUISIÇÃO"
-
-        # EVENTO: RETIRADA OU VENDA (Consumo de Lote FIFO)
-        elif cat in ['Retirada para carteira externa', 'Venda']:
-            qty_to_consume = abs(val)
-            total_cost_inherited = 0.0
-            lotes_detalhe = []
-            
-            if moeda in inventory and inventory[moeda]:
-                while qty_to_consume > 1e-9 and inventory[moeda]:
-                    lote = inventory[moeda][0]
-                    if lote['qty'] <= qty_to_consume:
-                        # Consome lote inteiro
-                        consumed_qty = lote['qty']
-                        total_cost_inherited += lote['cost']
-                        lotes_detalhe.append(f"{consumed_qty:.8f} de {lote['date']} {lote['hora']}")
-                        qty_to_consume -= consumed_qty
-                        inventory[moeda].pop(0)
-                    else:
-                        # Consome fração do lote
-                        fraction = qty_to_consume / lote['qty']
-                        cost_part = lote['cost'] * fraction
-                        total_cost_inherited += cost_part
-                        lotes_detalhe.append(f"{qty_to_consume:.8f} de {lote['date']} {lote['hora']}")
-                        lote['qty'] -= qty_to_consume
-                        lote['cost'] -= cost_part
-                        qty_to_consume = 0
+            for _, r in retiradas.iterrows():
+                moeda = r['Moeda']
+                qtd_saida = abs(r['Val_Numeric'])
+                custo_herdado_total = 0.0
                 
-                evento['Custo_Base_BRL'] = total_cost_inherited
-                evento['Lotes_Origem'] = " | ".join(lotes_detalhe)
-            else:
-                evento['Lotes_Origem'] = "ERRO: Lote não encontrado (verificar histórico)"
+                # Algoritmo FIFO (Consumir lotes antigos)
+                qtd_restante = qtd_saida
+                if moeda in inventory:
+                    while qtd_restante > 1e-9 and inventory[moeda]:
+                        lote = inventory[moeda][0] # Pega o lote mais antigo
+                        
+                        if lote['qty'] <= qtd_restante:
+                            # Consome o lote todo
+                            custo_herdado_total += lote['cost']
+                            qtd_restante -= lote['qty']
+                            inventory[moeda].pop(0) # Remove lote vazio
+                        else:
+                            # Consome fração do lote
+                            fracao = qtd_restante / lote['qty']
+                            custo_parcial = lote['cost'] * fracao
+                            custo_herdado_total += custo_parcial
+                            
+                            # Atualiza o lote remanescente
+                            lote['qty'] -= qtd_restante
+                            lote['cost'] -= custo_parcial
+                            qtd_restante = 0
+                
+                final_output.append({
+                    'operação': 'Retirada para carteira externa',
+                    'Data': data_s, 'hora': hora_s,
+                    'Moeda': moeda, 
+                    'quantidade': qtd_saida,
+                    'Valor': round(custo_herdado_total, 2), # Custo de Aquisição Herdado
+                    'Fees': round(miner_fees, 8),
+                    'Preço unitário': '' # Não aplicável em retirada (é média ponderada implícita)
+                })
 
-        results.append(evento)
-
-    # Gerar DataFrame final e exportar
-    df_final = pd.DataFrame(results)
-    df_final.to_csv('Relatorio_FIFO_Portugal.csv', index=False, sep=';', encoding='utf-8-sig')
-    print("Relatório gerado com sucesso: Relatorio_FIFO_Portugal.csv")
+    # Salvar
+    df_final = pd.DataFrame(final_output)
+    output_file = 'Relatorio_Corrigido_Final.csv'
+    df_final.to_csv(output_file, index=False, sep=';', decimal=',')
+    print(f"Sucesso! Arquivo gerado: {output_file}")
+    
+    # Debug: Mostrar as primeiras linhas para confirmação
+    print("\n--- Amostra das primeiras 5 linhas geradas ---")
+    print(df_final.head().to_string())
 
 # Executar
-processar_fifo('BitcoinTrade_statement.csv')
+processar_relatorio_final('BitcoinTrade_statement.csv')
