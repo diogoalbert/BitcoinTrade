@@ -55,16 +55,23 @@ def processar_bitcointrade_com_relatorios(
     """
 
     df = pd.read_csv(file_path, sep=";")
+
     # Normalização mínima esperada no layout BT
-    for col in ["Data", "Hora", "Categoria", "Moeda", "Valor"]:
+    # A BitcoinTrade tipicamente usa a coluna "Quantidade" para valores em fiat e quantidades em cripto.
+    # Algumas exportações alternativas usam "Valor". Este bloco aceita ambas.
+    for col in ["Data", "Hora", "Categoria", "Moeda"]:
         if col not in df.columns:
             raise ValueError(f"Coluna obrigatória ausente no CSV: {col}")
 
-    df["Val_Numeric"] = df["Valor"].apply(clean_val)
+    if "Quantidade" in df.columns:
+        df["Val_Numeric"] = df["Quantidade"].apply(clean_val)
+    elif "Valor" in df.columns:
+        df["Val_Numeric"] = df["Valor"].apply(clean_val)
+    else:
+        raise ValueError('Coluna obrigatória ausente no CSV: Quantidade (ou, alternativamente, Valor)')
+
     df["Timestamp"] = pd.to_datetime(df["Data"].astype(str) + " " + df["Hora"].astype(str), dayfirst=True, errors="coerce")
     df = df.sort_values("Timestamp")
-
-    # Inventário FIFO: por moeda, uma lista de lotes com qty, cost_total (na moeda fiat do custo) e date (origem)
     inventory: Dict[str, List[Dict[str, Any]]] = {}
 
     # Saída completa (estilo consolidado)
