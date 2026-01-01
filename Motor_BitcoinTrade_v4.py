@@ -1,6 +1,6 @@
 import pandas as pd
 import re
-from datetime import datetime
+import os
 
 def clean_val(val_str):
     if pd.isna(val_str): return 0.0
@@ -12,78 +12,72 @@ def clean_val(val_str):
     try: return float(s)
     except: return 0.0
 
-def processar_motor_portugal_v4(file_path):
+def processar_motor_final_triplo(file_path):
+    if not os.path.exists(file_path):
+        print(f"Erro: Arquivo {file_path} não encontrado!")
+        return
+
     df = pd.read_csv(file_path, sep=';')
     df['Val_Numeric'] = df['Quantidade'].apply(clean_val)
-    # Garante que a data seja lida corretamente
     df['Timestamp'] = pd.to_datetime(df['Data'] + ' ' + df['Hora'], dayfirst=True)
     df = df.sort_values(['Timestamp', 'Categoria'])
 
     inventory = {} 
     fiat_list = ['Real Brasileiro', 'BRL', 'Euro', 'EUR', 'US Dollar', 'USD']
-    saidas_finais = []
+    
+    log_irs = []    # Arquivo 1
+    log_swaps = []  # Arquivo 2
+    log_recon = []  # Arquivo 3
 
     for ts, group in df.groupby('Timestamp'):
         data_atual = ts
         
-        # 1. PROCESSAR ENTRADAS (Compras e Depósitos)
+        # --- 1. ENTRADAS (Build Inventory) ---
         entradas = group[(group['Val_Numeric'] > 0) & (~group['Moeda'].isin(fiat_list))]
         for _, row in entradas.iterrows():
             moeda = row['Moeda']
             qtd = abs(row['Val_Numeric'])
-            
-            # Identificar custo e se é origem externa
             custo_total = 0.0
             origem_ext = "Não"
             
             if "Depósito" in row['Categoria']:
                 origem_ext = "Sim"
                 custo_total = 0.0
+                log_recon.append({'Data': data_atual.strftime('%Y-%m-%d'), 'Moeda': moeda, 'Qtd': qtd, 'Tipo': 'Depósito', 'Status': 'Origem Externa (Custo 0)'})
             else:
-                # Se for compra, busca o valor pago em FIAT no mesmo timestamp
-                pago = group[(group['Val_Numeric'] < 0) & (group['Moeda'].isin(fiat_list))]
+                pago = group[(group['Val_Numeric'] < 0) & (group['Moeda'].isin(fiat_list) | (group['Moeda'] != moeda))]
                 custo_total = abs(pago['Val_Numeric'].sum()) if not pago.empty else 0.0
 
             if moeda not in inventory: inventory[moeda] = []
-            inventory[moeda].append({
-                'qtd': qtd, 
-                'custo': custo_total, 
-                'data_acq': data_atual, 
-                'ext': origem_ext
-            })
+            inventory[moeda].append({'qtd': qtd, 'custo': custo_total, 'data_acq': data_atual, 'ext': origem_ext})
 
-        # 2. PROCESSAR SAÍDAS (Vendas para FIAT)
-        vendas = group[(group['Categoria'].str.contains('Venda', na=False))]
-        for _, row_v in vendas.iterrows():
-            moeda_v = row_v['Moeda']
-            qtd_v = abs(row_v['Val_Numeric'])
-            
-            # Descobrir o valor recebido (Contraparte Fiat)
-            recebido = group[(group['Val_Numeric'] > 0) & (group['Moeda'].isin(fiat_list))]
-            valor_venda_total = recebido['Val_Numeric'].sum() if not recebido.empty else 0.0
-            moeda_recebida = recebido['Moeda'].iloc[0] if not recebido.empty else "N/A"
+        # --- 2. SAÍDAS (Consume Inventory) ---
+        saidas = group[group['Categoria'].str.contains('Venda|Retirada', na=False)]
+        for _, row_s in saidas.iterrows():
+            moeda_v = row_s['Moeda']
+            qtd_v = abs(row_s['Val_Numeric'])
+            if moeda_v in fiat_list: continue
+
+            recebido = group[(group['Val_Numeric'] > 0) & (group['Moeda'] != moeda_v)]
+            moeda_recebida = recebido['Moeda'].iloc[0] if not recebido.empty else "Carteira Externa"
+            valor_recebido_total = recebido['Val_Numeric'].sum() if not recebido.empty else 0.0
 
             if moeda_v in inventory:
                 restante = qtd_v
-                while restante > 0 and inventory[moeda_v]:
+                while restante > 1e-9 and inventory[moeda_v]:
                     lote = inventory[moeda_v][0]
                     qtd_a_retirar = min(lote['qtd'], restante)
                     
-                    # Proporcionalidade do custo e do valor de venda
-                    proporcao_lote = qtd_a_retirar / lote['qtd']
-                    proporcao_venda = qtd_a_retirar / qtd_v
+                    prop_lote = qtd_a_retirar / lote['qtd']
+                    prop_venda = qtd_a_retirar / qtd_v if qtd_v > 0 else 0
                     
-                    custo_lote = lote['custo'] * proporcao_lote
-                    valor_venda_lote = valor_venda_total * proporcao_venda
+                    custo_lote = lote['custo'] * prop_lote
+                    valor_venda_lote = valor_recebido_total * prop_venda
                     
-                    # Cálculo de Dias e Isenção
                     dias = (data_atual - lote['data_acq']).days
-                    if lote['ext'] == "Sim":
-                        isento_status = "TBD"
-                    else:
-                        isento_status = f"{'SIM' if dias > 365 else 'NÃO'} ({dias} dias)"
+                    isento_status = "TBD" if lote['ext'] == "Sim" else f"{'SIM' if dias > 365 else 'NÃO'} ({dias} dias)"
 
-                    saidas_finais.append({
+                    linha = {
                         'Data_Venda': data_atual.strftime('%Y-%m-%d'),
                         'Ativo': moeda_v,
                         'Moeda_Venda': moeda_recebida,
@@ -93,9 +87,16 @@ def processar_motor_portugal_v4(file_path):
                         'Origem_Externa': lote['ext'],
                         'Resultado': round(valor_venda_lote - custo_lote, 2),
                         'Isento_365d': isento_status
-                    })
+                    }
 
-                    # Atualiza inventário
+                    # Distribuição dos Relatórios
+                    if "Retirada" in row_s['Categoria']:
+                        log_recon.append({'Data': data_atual.strftime('%Y-%m-%d'), 'Moeda': moeda_v, 'Qtd': qtd_v, 'Tipo': 'Retirada', 'Status': 'Saída para Externa'})
+                    elif moeda_recebida in fiat_list:
+                        log_irs.append(linha)
+                    else:
+                        log_swaps.append(linha)
+
                     if lote['qtd'] <= restante:
                         restante -= lote['qtd']
                         inventory[moeda_v].pop(0)
@@ -104,8 +105,12 @@ def processar_motor_portugal_v4(file_path):
                         lote['custo'] -= custo_lote
                         restante = 0
 
-    return pd.DataFrame(saidas_finais)
+    # Salvar os 3 Arquivos
+    pd.DataFrame(log_irs).to_csv('Arquivo1_IRS.csv', index=False, sep=';', encoding='utf-8-sig')
+    pd.DataFrame(log_swaps).to_csv('Arquivo2_Swaps.csv', index=False, sep=';', encoding='utf-8-sig')
+    pd.DataFrame(log_recon).to_csv('Arquivo3_Reconciliacao.csv', index=False, sep=';', encoding='utf-8-sig')
+    
+    print("✓ Sucesso! Gerados: Arquivo1_IRS.csv, Arquivo2_Swaps.csv e Arquivo3_Reconciliacao.csv")
 
-# Execução e salvamento
-# res = processar_motor_portugal_v4('BitcoinTrade_statement.csv')
-# res.to_csv('Relatorio_IRS_Portugal.csv', index=False, sep=';')
+# Executar
+processar_motor_final_triplo('BitcoinTrade_statement.csv')
